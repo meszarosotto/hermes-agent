@@ -84,16 +84,17 @@ def test_fallback_activation_keeps_external_process_provider_on_chat_completions
     assert _fallback_api_mode_resolved(agent, "acme-http", "gpt-5.6", "https://proxy.example.invalid/v1") == "codex_responses"
 
 
-def test_should_stream_is_off_for_any_external_process_profile(monkeypatch):
-    """Streaming is disabled for every ACP provider, keyed on the profile — not on the ``acp://``
-    marker alone and not on one vendor's slug."""
+def test_should_stream_honors_external_process_client_capability(monkeypatch):
+    """Legacy ACP facades stay blocking, while a stateful facade may explicitly opt into streaming."""
     from agent.turn_api_call import _should_stream
     from providers.base import ProviderProfile
 
     profile = ProviderProfile(name="acme-acp", auth_type="external_process")
     monkeypatch.setattr("providers.get_provider_profile", lambda name: profile if name == "acme-acp" else None)
-    make = lambda provider: SimpleNamespace(  # noqa: E731
-        provider=provider, base_url="https://proxy.example.invalid/v1", _has_stream_consumers=lambda: True)
+    make = lambda provider, client=None: SimpleNamespace(  # noqa: E731
+        provider=provider, base_url="https://proxy.example.invalid/v1", client=client,
+        _disable_streaming=False, _has_stream_consumers=lambda: True)
 
     assert _should_stream(make("acme-acp")) is False
+    assert _should_stream(make("acme-acp", SimpleNamespace(supports_streaming=True))) is True
     assert _should_stream(make("acme-http")) is True

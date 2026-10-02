@@ -55,7 +55,11 @@ def _should_stream(agent: Any) -> bool:
     from hermes_cli.runtime_provider_backends import _is_external_process_provider
 
     if _base.startswith(("acp://", "acp+tcp://")) or _is_external_process_provider(agent.provider):
-        return False
+        # Legacy ACP shims synthesize a finite list of chunks only after their
+        # subprocess exits, so streaming them adds no progress and complicates
+        # cancellation. Stateful ACP clients explicitly opt in: their iterator
+        # yields message/reasoning deltas and heartbeat chunks while tools run.
+        return bool(getattr(getattr(agent, "client", None), "supports_streaming", False))
     if not agent._has_stream_consumers():
         if agent.provider == "moa":
             return False
