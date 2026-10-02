@@ -3165,6 +3165,7 @@ class _StreamingCall(StreamingWaitMonitor):
         pending_text_parts: list[str] = []
         tool_calls = _ToolCallAccumulator()
         tool_calls_acc = tool_calls.acc
+        acp_tool_progress_seen: set[str] = set()
         finish_reason = model_name = usage_obj = None
         response_id = upstream_provider = None  # the provider's own id / serving upstream, from the chunks
         role = "assistant"
@@ -3213,6 +3214,9 @@ class _StreamingCall(StreamingWaitMonitor):
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
             self._count_chunk(_diag, chunk)
+            if getattr(chunk, "acp_update", None) is not None:
+                from agent.acp_subprocess_client import _emit_acp_tool_progress
+                _emit_acp_tool_progress(chunk, self.agent, acp_tool_progress_seen)
             if self.agent._interrupt_requested:
                 _close_half_read_stream("interrupt_stream_close_failed")
                 break

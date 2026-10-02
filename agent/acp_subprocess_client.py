@@ -57,6 +57,7 @@ _PROTOCOL_VERSION = 1
 # Map ACP PromptResponse.stopReason → OpenAI finish_reason.
 _ACP_STOP_REASON_MAP = {
     "completed": "stop",
+    "end_turn": "stop",
     "cancelled": "stop",
     "canceled": "stop",
     "max_tokens": "length",
@@ -109,6 +110,11 @@ _ACP_TOOL_NAME_MAP = {
     "MultiEdit": "patch",
     "Glob": "search_files",
     "Grep": "search_files",
+    "shell": "terminal",
+    "read": "read_file",
+    "write": "write_file",
+    "glob": "search_files",
+    "grep": "search_files",
 }
 # Claude's rawInput arg keys differ from what build_tool_preview expects:
 # Claude file tools use `file_path`, Hermes previews key on `path`. Without
@@ -153,9 +159,14 @@ def _acp_tool_started(
     kind = str(update.get("sessionUpdate") or "").strip()
     if kind not in ("tool_call", "tool_call_update"):
         return None
-    meta = update.get("_meta") if isinstance(update.get("_meta"), dict) else {}
-    claude = meta.get("claudeCode") if isinstance(meta.get("claudeCode"), dict) else {}
-    raw_name = claude.get("toolName")
+    raw_meta = update.get("_meta")
+    meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+    raw_vendor_meta = meta.get("claudeCode")
+    vendor_meta: dict[str, Any] = raw_vendor_meta if isinstance(raw_vendor_meta, dict) else {}
+    raw_kiro_meta = meta.get("kiro")
+    if not vendor_meta and isinstance(raw_kiro_meta, dict):
+        vendor_meta = raw_kiro_meta
+    raw_name = vendor_meta.get("toolName")
     if not isinstance(raw_name, str) or not raw_name:
         return None
     raw_args = update.get("rawInput")
@@ -245,6 +256,7 @@ class ACPSubprocessClient:
         command: str | None = None,
         args: list[str] | None = None,
         permission_mode: str | None = None,
+        set_permission_mode: bool = True,
         provider_label: str = "claude-agent-acp",
         resume_session_id: str | None = None,
         timeout: Any = None,
@@ -264,6 +276,7 @@ class ACPSubprocessClient:
             self._args = []
         self._cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self._permission_mode = _resolve_permission_mode(permission_mode)
+        self._set_permission_mode = bool(set_permission_mode)
         self._provider_label = provider_label
         self._default_timeout = _coerce_timeout(timeout)
 
@@ -273,6 +286,9 @@ class ACPSubprocessClient:
         # Persistent process / session state.
         self._proc: subprocess.Popen[str] | None = None
         self._proc_lock = threading.Lock()
+        # One JSON-RPC request owns the shared inbox at a time. Streaming
+        # prompts hold this lock for their full generator lifetime.
+        self._request_lock = threading.RLock()
         # Serialize writes to the adapter's stdin: the worker thread sends
         # session/prompt while the outer poll loop may send session/cancel
         # cross-thread (see cancel()).
@@ -301,6 +317,9 @@ class ACPSubprocessClient:
         self._cumulative_cost_usd = 0.0
         self._context_used = 0
         self._context_size = 0
+        self._vendor_credits: float | None = None
+        self._context_usage_percentage: float | None = None
+        self._active_model_id: str | None = None
 
     # ------------------------------------------------------------------ #
     # Process lifecycle
@@ -405,6 +424,21 @@ class ACPSubprocessClient:
         text_parts: list[str] | None = None,
         reasoning_parts: list[str] | None = None,
     ) -> Any:
+        with self._request_lock:
+            return self._request_unlocked(
+                method, params, timeout_seconds=timeout_seconds,
+                text_parts=text_parts, reasoning_parts=reasoning_parts,
+            )
+
+    def _request_unlocked(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        text_parts: list[str] | None = None,
+        reasoning_parts: list[str] | None = None,
+    ) -> Any:
         assert self._proc is not None
         self._next_id += 1
         req_id = self._next_id
@@ -457,6 +491,10 @@ class ACPSubprocessClient:
 
         if method == "session/update" and msg_id is None:
             self._consume_session_update(params, text_parts, reasoning_parts)
+            return
+
+        if method == "_kiro.dev/metadata" and msg_id is None:
+            self._consume_kiro_metadata(params)
             return
 
         if msg_id is None:
@@ -527,6 +565,16 @@ class ACPSubprocessClient:
             if isinstance(amount, (int, float)):
                 self._cumulative_cost_usd = float(amount)
 
+    def _consume_kiro_metadata(self, params: dict[str, Any]) -> None:
+        """Capture Kiro-native metering without mislabelling credits as USD."""
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else params
+        credits = metadata.get("meteringUsage") if isinstance(metadata, dict) else None
+        context = metadata.get("contextUsagePercentage") if isinstance(metadata, dict) else None
+        if isinstance(credits, (int, float)):
+            self._vendor_credits = float(credits)
+        if isinstance(context, (int, float)):
+            self._context_usage_percentage = float(context)
+
     # ------------------------------------------------------------------ #
     # Error classification helpers (feeds stage-8 bridge)
     # ------------------------------------------------------------------ #
@@ -563,6 +611,15 @@ class ACPSubprocessClient:
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None and self._initialized:
                 return
+            # Messages from a dead process must never satisfy requests sent to
+            # its successor.
+            if self._proc is not None:
+                while True:
+                    try:
+                        self._inbox.get_nowait()
+                    except queue.Empty:
+                        break
+                self._stderr_tail.clear()
             self._proc = self._spawn()
         self.is_closed = False
 
@@ -663,7 +720,8 @@ class ACPSubprocessClient:
         # means a mid-life respawn resumes what this instance is holding rather
         # than a stale id resolved once at construction.
         self._resume_session_id = session_id
-        self._apply_permission_mode(session_id, timeout_seconds)
+        if self._set_permission_mode:
+            self._apply_permission_mode(session_id, timeout_seconds)
         self._initialized = True
         # Fresh process: nothing delivered to this process yet.
         self._delivered_count = 0
@@ -703,10 +761,13 @@ class ACPSubprocessClient:
         real context — we never replay the historical prefix.
         """
         msgs = [m for m in (messages or []) if isinstance(m, dict)]
+        replay_full_history = self.resume_failed is not None
         last_assistant = -1
         for i, m in enumerate(msgs):
             if str(m.get("role") or "").lower() == "assistant":
                 last_assistant = i
+        if replay_full_history:
+            last_assistant = -1
         delta = msgs[last_assistant + 1:]
         # First turn (no prior assistant): include leading system messages so
         # Claude adopts Hermes' task framing.
@@ -716,7 +777,9 @@ class ACPSubprocessClient:
             text = _render_message_content(m.get("content"))
             if not text:
                 continue
-            if role == "system":
+            if replay_full_history:
+                rendered.append(f"[{role.title() or 'Message'}]\n{text}")
+            elif role == "system":
                 rendered.append(f"[System instructions]\n{text}")
             elif role == "tool":
                 rendered.append(f"[Tool result]\n{text}")
@@ -740,6 +803,10 @@ class ACPSubprocessClient:
     ) -> Any:
         timeout_seconds = _coerce_timeout(timeout) if timeout is not None else self._default_timeout
         self._ensure_session(timeout_seconds)
+
+        if model and model != self._provider_label and model != self._active_model_id:
+            self.set_session_model(model, timeout_seconds=min(timeout_seconds, 30.0))
+            self._active_model_id = model
 
         # The stateful ACP session already holds the full server-side
         # conversation, so only the new turn (the delta over what was already
@@ -806,6 +873,8 @@ class ACPSubprocessClient:
             total_cost_usd=self._cumulative_cost_usd,
             context_used=self._context_used,
             context_size=self._context_size,
+            vendor_credits=self._vendor_credits,
+            context_usage_percentage=self._context_usage_percentage,
             acp_session_id=self.acp_session_id,
             # Resume flags, shared by the blocking and streaming paths (both call
             # _build_usage) so usage carries identical resume signals regardless
@@ -835,53 +904,52 @@ class ACPSubprocessClient:
         Bounded by genuine idle (no notification for ``timeout_seconds``) or
         adapter death — NOT total wall-clock — so a long agentic turn that keeps
         emitting events never false-times-out."""
-        cost_before = self._cumulative_cost_usd
-        self._next_id += 1
-        req_id = self._next_id
-        self._send({
-            "jsonrpc": "2.0", "id": req_id, "method": "session/prompt",
-            "params": {
-                "sessionId": self.acp_session_id,
-                "prompt": [{"type": "text", "text": prompt_text}],
-            },
-        })
-        stop_reason = ""
-        idle_deadline = time.monotonic() + timeout_seconds
-        while True:
-            if self._proc is None or self._proc.poll() is not None:
-                tail = "\n".join(self._stderr_tail).strip()
-                raise ACPSubprocessClientError(
-                    f"ACP adapter exited mid-stream. stderr:\n{tail}",
-                    reason=self._classify_stderr(tail),
-                )
-            if time.monotonic() > idle_deadline:
-                raise ACPSubprocessClientError(
-                    f"ACP stream idle for {timeout_seconds:.0f}s with no events.",
-                    reason="timeout",
-                )
-            try:
-                msg = self._inbox.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            # Any inbound event (notification OR the final result) means the
-            # adapter is alive and working — reset the idle deadline.
+        with self._request_lock:
+            cost_before = self._cumulative_cost_usd
+            self._next_id += 1
+            req_id = self._next_id
+            self._send({
+                "jsonrpc": "2.0", "id": req_id, "method": "session/prompt",
+                "params": {
+                    "sessionId": self.acp_session_id,
+                    "prompt": [{"type": "text", "text": prompt_text}],
+                },
+            })
+            stop_reason = ""
             idle_deadline = time.monotonic() + timeout_seconds
-            if isinstance(msg, dict) and msg.get("id") == req_id and (
-                "result" in msg or "error" in msg
-            ):
-                if "error" in msg:
-                    raise self._classify_rpc_error("session/prompt", msg.get("error") or {})
-                result = msg.get("result") or {}
-                stop_reason = str(result.get("stopReason") or "").strip()
-                break
-            chunk = self._stream_chunk_from_inbound(msg, model)
-            if chunk is None:
-                continue
-            yield chunk
+            while True:
+                if self._proc is None or self._proc.poll() is not None:
+                    tail = "\n".join(self._stderr_tail).strip()
+                    raise ACPSubprocessClientError(
+                        f"ACP adapter exited mid-stream. stderr:\n{tail}",
+                        reason=self._classify_stderr(tail),
+                    )
+                if time.monotonic() > idle_deadline:
+                    raise ACPSubprocessClientError(
+                        f"ACP stream idle for {timeout_seconds:.0f}s with no events.",
+                        reason="timeout",
+                    )
+                try:
+                    msg = self._inbox.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                idle_deadline = time.monotonic() + timeout_seconds
+                if isinstance(msg, dict) and msg.get("id") == req_id and (
+                    "result" in msg or "error" in msg
+                ):
+                    if "error" in msg:
+                        raise self._classify_rpc_error("session/prompt", msg.get("error") or {})
+                    result = msg.get("result") or {}
+                    stop_reason = str(result.get("stopReason") or "").strip()
+                    break
+                chunk = self._stream_chunk_from_inbound(msg, model)
+                if chunk is None:
+                    continue
+                yield chunk
 
-        self._delivered_count = new_count
-        finish_reason = _ACP_STOP_REASON_MAP.get(stop_reason.lower(), "stop")
-        yield self._final_chunk(model, finish_reason, self._build_usage(cost_before))
+            self._delivered_count = new_count
+            finish_reason = _ACP_STOP_REASON_MAP.get(stop_reason.lower(), "stop")
+            yield self._final_chunk(model, finish_reason, self._build_usage(cost_before))
 
     def _stream_chunk_from_inbound(self, msg: dict[str, Any], model: str | None) -> Any:
         if not isinstance(msg, dict):

@@ -7,6 +7,7 @@ normalization, session resume, and the usage/cost contract.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +15,9 @@ import pytest
 from agent.acp_subprocess_client import (
     ACPSubprocessClient,
     ACPSubprocessClientError,
+    ACPStreamUpdate,
+    _acp_tool_started,
+    _emit_acp_tool_progress,
     _resolve_command,
     _resolve_permission_mode,
     _coerce_timeout,
@@ -131,6 +135,22 @@ def test_delta_tool_results_labelled():
     assert "ok continue" in text
 
 
+def test_resume_failure_reseeds_full_role_labelled_history():
+    c = _client()
+    c.resume_failed = {"sid": "lost", "reason": "protocol"}
+    text, count = c._compute_delta([
+        {"role": "system", "content": "Be terse."},
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+    ])
+    assert "[System]\nBe terse." in text
+    assert "[User]\nfirst question" in text
+    assert "[Assistant]\nfirst answer" in text
+    assert "[User]\nsecond question" in text
+    assert count == 4
+
+
 # ── error classification (feeds stage-8 bridge) ──────────────────────
 
 def test_classify_stderr_auth():
@@ -179,6 +199,44 @@ def test_usage_update_captures_cost_and_context():
     assert c._cumulative_cost_usd == pytest.approx(0.0791)
     assert c._context_used == 27624
     assert c._context_size == 1000000
+
+
+def test_kiro_metadata_keeps_credits_separate_from_usd():
+    c = _client()
+    c._consume_kiro_metadata({"meteringUsage": 2.75, "contextUsagePercentage": 41.5})
+    usage = c._build_usage(0.0)
+    assert usage.vendor_credits == pytest.approx(2.75)
+    assert usage.context_usage_percentage == pytest.approx(41.5)
+    assert usage.cost_usd == 0.0
+
+
+def test_kiro_tool_name_is_normalized_for_hermes_progress():
+    started = _acp_tool_started({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "k1",
+        "_meta": {"kiro": {"toolName": "shell"}},
+        "rawInput": {"command": "pwd"},
+    }, set())
+    assert started == ("terminal", {"command": "pwd"})
+
+
+def test_kiro_tool_progress_callback_is_emitted_once():
+    events = []
+    agent = SimpleNamespace(
+        tool_progress_callback=lambda *args: events.append(args),
+    )
+    update = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "k1",
+        "_meta": {"kiro": {"toolName": "shell"}},
+        "rawInput": {"command": "pwd"},
+    }
+    chunk = SimpleNamespace(acp_update=ACPStreamUpdate("tool_call_update", update))
+    seen = set()
+    _emit_acp_tool_progress(chunk, agent, seen)
+    _emit_acp_tool_progress(chunk, agent, seen)
+    assert len(events) == 1
+    assert events[0][0:2] == ("tool.started", "terminal")
 
 
 def test_agent_message_chunk_accumulates_text():
@@ -391,6 +449,31 @@ def test_response_usage_carries_acp_session_id_surviving_close():
     assert resp.usage.acp_session_id == "sess-LIVE-1"
 
 
+def test_requested_model_is_applied_once_before_prompt():
+    c = _client(provider_label="kiro-acp")
+    calls = []
+
+    def _fake_ensure(timeout_seconds):
+        c.acp_session_id = "sess-model"
+        c._initialized = True
+
+    def _fake_request(method, params, *, timeout_seconds, text_parts=None, reasoning_parts=None):
+        calls.append((method, params))
+        if text_parts is not None:
+            text_parts.append("ok")
+
+    with patch.object(c, "_ensure_session", side_effect=_fake_ensure), \
+         patch.object(c, "_request", side_effect=_fake_request):
+        for _ in range(2):
+            c._create_chat_completion(
+                model="claude-sonnet-4.5",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+    model_calls = [params for method, params in calls if method == "session/set_model"]
+    assert model_calls == [{"sessionId": "sess-model", "modelId": "claude-sonnet-4.5"}]
+
+
 def test_thought_chunk_goes_to_reasoning():
     c = _client()
     reasoning: list[str] = []
@@ -458,6 +541,7 @@ def test_prompt_stream_yields_content_reasoning_heartbeat_and_final():
 
 @pytest.mark.parametrize("stop_reason,expected", [
     ("completed", "stop"),
+    ("end_turn", "stop"),
     ("max_tokens", "length"),
     ("maxTokens", "length"),
     ("cancelled", "stop"),
@@ -569,7 +653,7 @@ def test_streaming_and_blocking_usage_flags_match_on_resume_failure():
     c1, ensure1 = _make()
     with patch.object(c1, "_ensure_session", side_effect=ensure1), \
          patch.object(c1, "_request", side_effect=_fake_request):
-        blocking = c1._create_chat_completion(model="m", messages=msgs)
+        blocking = c1._create_chat_completion(model="claude-agent-acp", messages=msgs)
 
     c2, ensure2 = _make()
 
@@ -578,7 +662,9 @@ def test_streaming_and_blocking_usage_flags_match_on_resume_failure():
 
     with patch.object(c2, "_ensure_session", side_effect=ensure2), \
          patch.object(c2, "_prompt_stream", side_effect=_fake_prompt_stream):
-        streaming_usage = list(c2._create_chat_completion(model="m", stream=True, messages=msgs))[-1].usage
+        streaming_usage = list(c2._create_chat_completion(
+            model="claude-agent-acp", stream=True, messages=msgs,
+        ))[-1].usage
 
     assert blocking.usage.acp_resumed == streaming_usage.acp_resumed is False
     assert blocking.usage.acp_resume_failed == streaming_usage.acp_resume_failed == rf
