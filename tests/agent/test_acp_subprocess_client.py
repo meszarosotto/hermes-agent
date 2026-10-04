@@ -93,6 +93,7 @@ def test_delta_first_turn_includes_system_and_user():
 
 def test_delta_second_turn_sends_only_trailing_user():
     c = _client()
+    c._delivered_count = 2  # this session already received the first exchange
     msgs = [
         {"role": "system", "content": "Be terse."},
         {"role": "user", "content": "first question"},
@@ -111,6 +112,7 @@ def test_delta_after_compaction_only_sends_new_user_turn():
     # Hermes compaction rewrites the prefix into a summary; the stateful ACP
     # session already holds real context, so we must send only the new turn.
     c = _client()
+    c._delivered_count = 7  # prompted before compaction shortened the transcript
     msgs = [
         {"role": "system", "content": "[summary of earlier conversation]"},
         {"role": "assistant", "content": "older answer kept by compaction"},
@@ -124,6 +126,7 @@ def test_delta_after_compaction_only_sends_new_user_turn():
 
 def test_delta_tool_results_labelled():
     c = _client()
+    c._delivered_count = 1
     msgs = [
         {"role": "assistant", "content": "prior"},
         {"role": "tool", "content": "tool output here"},

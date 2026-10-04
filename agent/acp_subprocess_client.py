@@ -759,13 +759,25 @@ class ACPSubprocessClient:
         assistant message. This is robust to Hermes-side compaction (which
         rewrites the prefix) because the stateful ACP session already holds the
         real context — we never replay the historical prefix.
+
+        That holds only for a session that has the prefix: one this client
+        already prompted, or one restored with session/load. A session this
+        client just opened with session/new has nothing, yet the transcript may
+        already hold earlier turns — Hermes builds such clients mid-conversation:
+        the request client is closed after every stream error (a stale-stream
+        kill included) and replaced, and the background review builds its own.
+        Sending only the trailing turn there gave the model a bare continuation
+        nudge with no task ("I don't have any prior task content in this
+        session"). So such a session, like one whose session/load failed, gets
+        the whole role-labelled transcript once; later turns are deltas again.
         """
         msgs = [m for m in (messages or []) if isinstance(m, dict)]
-        replay_full_history = self.resume_failed is not None
         last_assistant = -1
         for i, m in enumerate(msgs):
             if str(m.get("role") or "").lower() == "assistant":
                 last_assistant = i
+        session_lacks_prefix = not self.resumed and self._delivered_count == 0 and last_assistant >= 0
+        replay_full_history = self.resume_failed is not None or session_lacks_prefix
         if replay_full_history:
             last_assistant = -1
         delta = msgs[last_assistant + 1:]
