@@ -28,10 +28,12 @@ Stage references map to scripts/claude-agent-acp-hermes-plan-v4.md.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -66,6 +68,55 @@ _ACP_STOP_REASON_MAP = {
     "refusal": "stop",
 }
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = os.name == "nt"
+# How long close() lets the adapter's process tree exit after SIGTERM before
+# SIGKILL. Kiro flushes its session store on exit; three seconds is what the
+# previous terminate-then-wait allowed the adapter alone.
+_TREE_EXIT_GRACE_SECONDS = 3.0
+
+
+def _end_process_tree(proc: subprocess.Popen[str]) -> None:
+    """End the adapter and every process it started. Never raises.
+
+    The adapter runs the agent's own tools (kiro-cli: shell commands, builds,
+    tests) as its children. Terminating the adapter alone re-parented them to
+    init: a Kiro worker's hung `cargo test` survived six stale-stream kills and
+    kept running for 1.5 hours. _spawn makes the adapter the leader of its own
+    process group, so signalling the group reaches the whole tree. Whatever is
+    still there after the grace period is killed.
+    """
+    if _IS_WINDOWS:
+        try:
+            proc.terminate()
+            proc.wait(timeout=_TREE_EXIT_GRACE_SECONDS)
+        except Exception:
+            with contextlib.suppress(Exception):
+                proc.kill()
+        return
+    pgid = proc.pid
+    _signal_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + _TREE_EXIT_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None and not _group_alive(pgid):
+            return
+        time.sleep(0.05)
+    _signal_group(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=2)
+
+
+def _signal_group(pgid: int, sig: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, sig)  # windows-footgun: ok - POSIX only, _end_process_tree returns earlier on Windows
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)  # windows-footgun: ok - POSIX only, see _signal_group
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def _resolve_command(command: str | None) -> str:
@@ -335,6 +386,11 @@ class ACPSubprocessClient:
                 bufsize=1,
                 cwd=self._cwd,
                 env=_build_subprocess_env(),
+                # Own process group: the adapter runs the agent's tools as its
+                # children, and close() ends the group, not just the adapter.
+                # It also keeps the terminal's Ctrl+C from killing the live
+                # session; Hermes interrupts a turn with session/cancel.
+                start_new_session=not _IS_WINDOWS,
             )
         except FileNotFoundError as exc:
             raise ACPSubprocessClientError(
@@ -381,14 +437,7 @@ class ACPSubprocessClient:
         self.acp_session_id = None
         if proc is None:
             return
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        _end_process_tree(proc)
 
     def cancel(self) -> None:
         """Cleanly interrupt the in-flight turn via the ACP ``session/cancel``
